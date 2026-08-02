@@ -35,93 +35,74 @@
 // --- Pinos Atuadores ---
 #define SQUIB_PIN    33
 #define LED_R        2
-#define LED_G        27
-#define LED_B        25
-#define BUZZER_PIN   32
 #define BMP_ADDR     0x76
 
-#define BUZZER_RES   8
-
 // --------------------------------------------------------------------------
-// LED E BUZZER
+// LED de debug
 // --------------------------------------------------------------------------
-void ledSet(bool r, bool g, bool b) {
-  digitalWrite(LED_R, r ? HIGH : LOW);
-  digitalWrite(LED_G, g ? HIGH : LOW);
-  digitalWrite(LED_B, b ? HIGH : LOW);
-}
-void ledOff()      { ledSet(false, false, false); }
-void ledVermelho() { ledSet(true,  false, false); }
-void ledAmarelo()  { ledSet(true,  true,  false); }
-void ledVerde()    { ledSet(false, true,  false); }
-void ledAzul()     { ledSet(false, false, true);  }
-void ledBranco()   { ledSet(true,  true,  true);  }
+void ledOff()      { digitalWrite(LED_R, LOW); }
+void ledVermelho() { digitalWrite(LED_R, HIGH); }
+void ledVerde()    { digitalWrite(LED_R, HIGH); }
 
-void buzzerTom(uint16_t freq, uint16_t durMs) {
-  if (freq == 0) {
-    ledcWrite(BUZZER_PIN, 0);
-  } else {
-    ledcWriteTone(BUZZER_PIN, freq);
-    ledcWrite(BUZZER_PIN, 128);
+void blinkDebug(uint8_t times, uint16_t onMs, uint16_t offMs) {
+  for (uint8_t i = 0; i < times; i++) {
+    digitalWrite(LED_R, HIGH);
+    delay(onMs);
+    digitalWrite(LED_R, LOW);
+    delay(offMs);
   }
-  delay(durMs);
-  ledcWrite(BUZZER_PIN, 0);
-}
-
-void buzzerSilencio(uint16_t durMs) {
-  ledcWrite(BUZZER_PIN, 0);
-  delay(durMs);
 }
 
 void sinalBoot() {
-  for (int i = 0; i < 3; i++) { ledBranco(); buzzerTom(1000, 80); ledOff(); delay(80); }
+  blinkDebug(3, 80, 80);
 }
 void sinalSensorOK(uint8_t n) {
-  for (uint8_t i = 0; i < n; i++) { ledVerde(); buzzerTom(1800, 60); ledOff(); delay(120); }
+  blinkDebug(n, 60, 120);
 }
 void sinalSensorFalha() {
-  for (int i = 0; i < 3; i++) { ledVermelho(); buzzerTom(200, 100); ledOff(); delay(80); }
+  blinkDebug(3, 100, 80);
 }
 void sinalLoRaOK() {
-  for (int i = 0; i < 4; i++) { ledAzul(); buzzerTom(1200, 60); ledOff(); delay(120); }
+  blinkDebug(4, 60, 120);
 }
 void sinalPronto() {
-  ledAmarelo();
-  buzzerTom(800,  80); buzzerSilencio(40);
-  buzzerTom(1000, 80); buzzerSilencio(40);
-  buzzerTom(1200, 80); buzzerSilencio(40);
-  buzzerTom(1600, 120);
+  blinkDebug(4, 80, 40);
 }
 void sinalLancamento() {
-  ledVerde();
-  for (int f = 800; f <= 2400; f += 200) { ledcWriteTone(BUZZER_PIN, f); ledcWrite(BUZZER_PIN, 128); delay(40); }
-  ledcWrite(BUZZER_PIN, 0);
+  blinkDebug(4, 40, 40);
 }
 void sinalApogeu() {
-  for (int i = 0; i < 6; i++) { ledVermelho(); buzzerTom(2000, 60); ledAmarelo(); buzzerTom(1400, 60); }
-  ledOff(); buzzerSilencio(50);
+  blinkDebug(6, 60, 60);
 }
 void sinalSquibDesligado() {
-  ledAmarelo(); buzzerTom(1000, 150); buzzerSilencio(100); buzzerTom(1000, 150); ledOff();
+  blinkDebug(2, 150, 100);
 }
 void sinalPouso() {
-  for (int i = 0; i < 3; i++) { ledVerde(); buzzerTom(1600, 150); ledOff(); delay(150); }
-  buzzerSilencio(100);
-  for (int f = 1600; f >= 400; f -= 200) { ledcWriteTone(BUZZER_PIN, f); ledcWrite(BUZZER_PIN, 128); delay(60); }
-  ledcWrite(BUZZER_PIN, 0); ledVermelho();
+  blinkDebug(3, 150, 150);
 }
 void sinalGPSEnviado() {
-  for (int i = 0; i < 2; i++) { ledAzul(); buzzerTom(1400, 80); ledOff(); delay(80); }
-  ledVermelho();
+  blinkDebug(2, 80, 80);
+  digitalWrite(LED_R, HIGH);
 }
 void sinalBeacon() {
   Serial.println(F("[BEACON] Sinal de localizacao ativo (5s)"));
   uint32_t inicio = millis();
-  while (millis() - inicio < 5000) { ledAmarelo(); buzzerTom(2200, 80); ledOff(); delay(170); }
-  ledVermelho();
+  while (millis() - inicio < 5000) {
+    digitalWrite(LED_R, HIGH);
+    delay(80);
+    digitalWrite(LED_R, LOW);
+    delay(170);
+  }
+  digitalWrite(LED_R, HIGH);
 }
 void sinalErroCritico() {
-  while (1) { ledVermelho(); buzzerTom(300, 400); ledOff(); buzzerSilencio(200); delay(1000); }
+  while (1) {
+    digitalWrite(LED_R, HIGH);
+    delay(400);
+    digitalWrite(LED_R, LOW);
+    delay(200);
+    delay(1000);
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -334,8 +315,7 @@ void VerificacaoSistema() {
 void setup() {
   Serial.begin(115200); delay(500);
   pinMode(SQUIB_PIN, OUTPUT); digitalWrite(SQUIB_PIN, LOW);
-  pinMode(LED_R, OUTPUT); pinMode(LED_G, OUTPUT); pinMode(LED_B, OUTPUT); ledOff();
-  ledcAttach(BUZZER_PIN, 2000, BUZZER_RES); ledcWrite(BUZZER_PIN, 0);
+  pinMode(LED_R, OUTPUT); ledOff();
 
   ledVermelho(); sinalBoot();
   Wire.begin(21, 22); Wire.setClock(100000);
