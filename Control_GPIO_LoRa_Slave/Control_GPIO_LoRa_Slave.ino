@@ -1,7 +1,9 @@
 /*
   Slave.ino  -  FOGUETE (LoRa_E220 + logging de status de envio/recepcao)
-  Sensor de pressão: BMP280
-  v3.4 — Adaptado exclusivamente para BMP280 (Modo Contínuo)
+  Sensor de pressao: BMP280
+  v4.0 — Protocolo unificado (Response de tamanho fixo), dump do SD em
+         binario (mais rapido e ~40% menor que texto), checksum CRC8 e
+         reenvio pontual de registros (CMD_RESEND_SD).
 */
 
 #include "Arduino.h"
@@ -123,7 +125,7 @@ void sinalErroCritico() {
 }
 
 // --------------------------------------------------------------------------
-// Instâncias
+// Instancias
 // --------------------------------------------------------------------------
 LoRa_E220 Transceiver(&Serial2, PIN_AUX, PIN_M0, PIN_M1);
 HardwareSerial SerialGPS(1);
@@ -135,7 +137,8 @@ SPIClass spiSD(HSPI);
 bool statusBMP   = false, statusMPU = false, statusSD = false, statusLoRa = false, statusSquib = false;
 
 float altitudeAtual = 0.0, velocidadeAtual = 0.0, altitudeMaxima = -9999.0, pressaoBase = 0.0;
-char nomeArquivoVoo[20] = "/voo_001.csv";
+char nomeArquivoVoo[20]    = "/voo_001.csv"; // log legivel (para leitura direta do cartao)
+char nomeArquivoVooBin[20] = "/voo_001.bin"; // log binario (usado no dump via LoRa)
 
 enum EstadoVoo { AGUARDANDO, SUBIDA, DESCIDA, POUSADO };
 EstadoVoo estadoAtual = AGUARDANDO;
@@ -147,33 +150,58 @@ uint32_t tempoAcionamentoSquib = 0, tempoPouso = 0, tempoUltimoBeacon = 0;
 bool     gpsPousoEnviado = false, beaconAtivo = false;
 
 #define SD_BUFFER_MAX 40
-struct LogLine {
-  uint32_t tempo; uint8_t estado;
-  float altitude, velocidade, accX, accY, accZ, lat, lon;
-};
-LogLine sdBuffer[SD_BUFFER_MAX];
+LogLine sdBuffer[SD_BUFFER_MAX]; // LogLine agora vem de LoRaProtocol.h (struct compartilhada)
 uint8_t sdBufferIdx = 0;
 
+// --------------------------------------------------------------------------
+// Helpers de protocolo (Response com checksum)
+// --------------------------------------------------------------------------
+Response montarResposta(uint8_t tipo) {
+  Response r;
+  memset(&r, 0, sizeof(Response)); // zera tudo, inclusive bytes nao usados do union (deterministico p/ checksum)
+  r.resp      = tipo;
+  r.timestamp = millis();
+  return r;
+}
+
+void enviarResposta(Response& r) {
+  r.checksum = calcChecksum(r);
+  Transceiver.sendMessage((void*)&r, sizeof(r));
+}
+
+// --------------------------------------------------------------------------
+// SD - gravacao (CSV legivel + binario para dump rapido via LoRa)
+// --------------------------------------------------------------------------
 void FlushBufferSD() {
   if (!statusSD || sdBufferIdx == 0) return;
-  File file = SD.open(nomeArquivoVoo, FILE_APPEND);
-  if (file) {
+
+  // 1) Log legivel (para leitura direta do cartao, fora do voo)
+  File fcsv = SD.open(nomeArquivoVoo, FILE_APPEND);
+  if (fcsv) {
     for (uint8_t i = 0; i < sdBufferIdx; i++) {
-      file.print(sdBuffer[i].tempo);       file.print(",");
-      file.print(sdBuffer[i].estado);      file.print(",");
-      file.print(sdBuffer[i].altitude, 2); file.print(",");
-      file.print(sdBuffer[i].velocidade, 2); file.print(",");
-      file.print(sdBuffer[i].accX, 3);     file.print(",");
-      file.print(sdBuffer[i].accY, 3);     file.print(",");
-      file.print(sdBuffer[i].accZ, 3);     file.print(",");
+      fcsv.print(sdBuffer[i].tempo);        fcsv.print(",");
+      fcsv.print(sdBuffer[i].estado);       fcsv.print(",");
+      fcsv.print(sdBuffer[i].altitude, 2);  fcsv.print(",");
+      fcsv.print(sdBuffer[i].velocidade, 2);fcsv.print(",");
+      fcsv.print(sdBuffer[i].accX, 3);      fcsv.print(",");
+      fcsv.print(sdBuffer[i].accY, 3);      fcsv.print(",");
+      fcsv.print(sdBuffer[i].accZ, 3);      fcsv.print(",");
       if (sdBuffer[i].lat != 0.0 || sdBuffer[i].lon != 0.0) {
-        file.print(sdBuffer[i].lat, 6); file.print(","); file.println(sdBuffer[i].lon, 6);
+        fcsv.print(sdBuffer[i].lat, 6); fcsv.print(","); fcsv.println(sdBuffer[i].lon, 6);
       } else {
-        file.println("0,0");
+        fcsv.println("0,0");
       }
     }
-    file.close();
+    fcsv.close();
   }
+
+  // 2) Log binario (fonte usada no dump via LoRa: sem parsing, leitura direta por offset)
+  File fbin = SD.open(nomeArquivoVooBin, FILE_APPEND);
+  if (fbin) {
+    fbin.write((uint8_t*)sdBuffer, sizeof(LogLine) * sdBufferIdx);
+    fbin.close();
+  }
+
   sdBufferIdx = 0;
 }
 
@@ -197,8 +225,9 @@ void SalvaDadosSD(sensors_event_t& a, sensors_event_t& g) {
 void criarArquivoVoo() {
   uint8_t num = 1;
   while (num < 255) {
-    sprintf(nomeArquivoVoo, "/voo_%03d.csv", num);
-    if (!SD.exists(nomeArquivoVoo)) break;
+    sprintf(nomeArquivoVoo,    "/voo_%03d.csv", num);
+    sprintf(nomeArquivoVooBin, "/voo_%03d.bin", num);
+    if (!SD.exists(nomeArquivoVoo) && !SD.exists(nomeArquivoVooBin)) break;
     num++;
   }
   File csv = SD.open(nomeArquivoVoo, FILE_WRITE);
@@ -207,7 +236,14 @@ void criarArquivoVoo() {
     csv.close();
     Serial.print(F("[SD] Arquivo criado: ")); Serial.println(nomeArquivoVoo);
   } else {
-    Serial.println(F("[SD] ERRO ao criar arquivo!"));
+    Serial.println(F("[SD] ERRO ao criar arquivo CSV!"));
+  }
+  File bin = SD.open(nomeArquivoVooBin, FILE_WRITE);
+  if (bin) {
+    bin.close();
+    Serial.print(F("[SD] Arquivo binario criado: ")); Serial.println(nomeArquivoVooBin);
+  } else {
+    Serial.println(F("[SD] ERRO ao criar arquivo binario!"));
   }
 }
 
@@ -231,23 +267,23 @@ void VerificacaoSistema() {
   Serial.println(F("========================================"));
 
   // O BMP280 pode usar 0x76 ou 0x77. Usaremos 0x76 conforme definido.
-  statusBMP = bmp.begin(BMP_ADDR); 
+  statusBMP = bmp.begin(BMP_ADDR);
   if (!statusBMP) {
-    // Tenta com o chip ID genérico caso seja uma variante chinesa comum (0x58)
+    // Tenta com o chip ID generico caso seja uma variante chinesa comum (0x58)
     statusBMP = bmp.begin(BMP_ADDR, 0x58);
   }
 
   if (statusBMP) {
-    // Configura o BMP280 para rodar de forma contínua em background (MODE_NORMAL)
-    // Otimizado para leitura rápida de altitude em foguetes
+    // Configura o BMP280 para rodar de forma continua em background (MODE_NORMAL)
+    // Otimizado para leitura rapida de altitude em foguetes
     bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
                     Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
                     Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
                     Adafruit_BMP280::FILTER_X16,      /* Filtering. */
                     Adafruit_BMP280::STANDBY_MS_1);   /* Standby time. */
-    Serial.println(F("  [OK] BMP280")); sinalSensorOK(2); 
-  } else { 
-    Serial.println(F("  [FALHA] BMP280")); sinalSensorFalha(); 
+    Serial.println(F("  [OK] BMP280")); sinalSensorOK(2);
+  } else {
+    Serial.println(F("  [FALHA] BMP280")); sinalSensorFalha();
   }
   delay(300);
 
@@ -317,6 +353,7 @@ void setup() {
 
   sinalPronto();
   Serial.println(F("===== SLAVE (FOGUETE) PRONTO ====="));
+  Serial.print(F("Tamanho do pacote (Response): ")); Serial.print(sizeof(Response)); Serial.println(F(" bytes"));
 }
 
 void loop() {
@@ -332,17 +369,17 @@ void loop() {
   }
 
   uint32_t now = millis();
-  
-  // Leitura direta do BMP280 - Não precisa de estado assíncrono manual
+
+  // Leitura direta do BMP280 - Nao precisa de estado assincrono manual
   if (now - tempoUltimoBMP >= 25) { // 40Hz
     float novaAlt = bmp.readAltitude(pressaoBase);
-    
+
     if (tempoUltimoBMP > 0) {
       float dt = (now - tempoUltimoBMP) / 1000.0;
       if (dt > 0.0) velocidadeAtual = (novaAlt - altitudeAtual) / dt;
     }
-    
-    altitudeAtual = novaAlt; 
+
+    altitudeAtual = novaAlt;
     tempoUltimoBMP = now;
     if (sdBufferIdx >= SD_BUFFER_MAX) FlushBufferSD();
   }
@@ -386,10 +423,10 @@ void ControleDeVoo() {
   }
   else if (estadoAtual == POUSADO) {
     if (!gpsPousoEnviado && (now - tempoPouso >= 1000)) {
-      Response r; memset(&r, 0, sizeof(Response));
-      r.timestamp = millis(); r.contador = _numLeituras++; r.resp = RESP_GPS;
-      r.lat = gps.location.isValid() ? gps.location.lat() : 0.0; r.lon = gps.location.isValid() ? gps.location.lng() : 0.0;
-      Transceiver.sendMessage(&r, sizeof(r)); gpsPousoEnviado = true; sinalGPSEnviado();
+      Response r = montarResposta(RESP_GPS);
+      r.dados.gps.lat = gps.location.isValid() ? gps.location.lat() : 0.0;
+      r.dados.gps.lon = gps.location.isValid() ? gps.location.lng() : 0.0;
+      enviarResposta(r); gpsPousoEnviado = true; sinalGPSEnviado();
     }
     if (beaconAtivo && (now - tempoUltimoBeacon >= 90000)) { tempoUltimoBeacon = now; sinalBeacon(); }
   }
@@ -400,7 +437,7 @@ void ControleDeVoo() {
 
   if (now - tempoUltimoLog >= 50) { SalvaDadosSD(a, g); tempoUltimoLog = now; }
   if (estadoAtual == SUBIDA || estadoAtual == DESCIDA) {
-    if (now - tempoUltimoLoRa >= 750) { Command c; c.cmd = CMD_READ; atenderComando(c); tempoUltimoLoRa = now; }
+    if (now - tempoUltimoLoRa >= 750) { Command c; c.cmd = CMD_READ; c.param = 0; atenderComando(c); tempoUltimoLoRa = now; }
   }
 
   static uint32_t tempoUltimoFlush = 0;
@@ -409,37 +446,33 @@ void ControleDeVoo() {
   }
 }
 
-void enviarResposta(const Response& r) {
-  Serial.println("resposta enviada");
-  Transceiver.sendMessage((void*)&r, sizeof(r));
-}
-
 void atenderComando(const Command& c) {
-  Response r; memset(&r, 0, sizeof(Response));
-  r.timestamp = millis(); r.contador = estadoAtual;
-
-    Serial.print("Comando Recebido - ");
-    Serial.println(c.cmd);
+  Serial.print("Comando Recebido - ");
+  Serial.println(c.cmd);
 
   switch (c.cmd) {
-    case CMD_READ:
-      r.resp  = RESP_DATA;
-      r.alt   = altitudeAtual;
-      r.speed = abs(velocidadeAtual);
-      r.lat   = gps.location.isValid() ? gps.location.lat() : 0.0;
-      r.lon   = gps.location.isValid() ? gps.location.lng() : 0.0;
+    case CMD_READ: {
+      Response r = montarResposta(RESP_DATA);
+      r.contador          = estadoAtual;
+      r.dados.telemetria.alt   = altitudeAtual;
+      r.dados.telemetria.speed = abs(velocidadeAtual);
+      r.dados.telemetria.lat   = gps.location.isValid() ? gps.location.lat() : 0.0;
+      r.dados.telemetria.lon   = gps.location.isValid() ? gps.location.lng() : 0.0;
       enviarResposta(r);
       break;
-    case CMD_GET_GPS:
-      r.resp = RESP_GPS;
-      r.lat  = gps.location.isValid() ? gps.location.lat() : 0.0;
-      r.lon  = gps.location.isValid() ? gps.location.lng() : 0.0;
+    }
+    case CMD_GET_GPS: {
+      Response r = montarResposta(RESP_GPS);
+      r.dados.gps.lat = gps.location.isValid() ? gps.location.lat() : 0.0;
+      r.dados.gps.lon = gps.location.isValid() ? gps.location.lng() : 0.0;
       enviarResposta(r);
       break;
-    case CMD_PING:
-      r.resp = RESP_PONG;
+    }
+    case CMD_PING: {
+      Response r = montarResposta(RESP_PONG);
       enviarResposta(r);
       break;
+    }
     case CMD_ARMAR:
       estadoAtual = SUBIDA; Serial.println(F("[CMD] Armado manualmente."));
       break;
@@ -450,22 +483,89 @@ void atenderComando(const Command& c) {
     case CMD_DOWNLOAD_SD:
       if (estadoAtual == AGUARDANDO || estadoAtual == POUSADO) { FlushBufferSD(); EnviaDadosSDLoRa(); }
       break;
+    case CMD_RESEND_SD:
+      enviarRegistroSD(c.param);
+      break;
   }
 }
 
+// --------------------------------------------------------------------------
+// Dump do SD via LoRa - binario, com seq + checksum, muito mais leve que o
+// envio de bytes crus de texto CSV da v3.4 (~40% menos bytes por registro
+// e framing correto, ja que todo pacote usa a mesma struct Response).
+// --------------------------------------------------------------------------
 void EnviaDadosSDLoRa() {
   if (!statusSD) return;
-  Serial.println(F("[SD] Iniciando envio via LoRa..."));
-  File file = SD.open(nomeArquivoVoo, FILE_READ);
-  if (file) {
-    uint8_t buffer[60];
-    while (file.available()) {
-      int idx = 0;
-      while (file.available() && idx < 60) buffer[idx++] = file.read();
-      Transceiver.sendMessage(buffer, idx);
-      delay(200);
-    }
-    file.close();
+
+  File file = SD.open(nomeArquivoVooBin, FILE_READ);
+  if (!file) { Serial.println(F("[SD] ERRO ao abrir arquivo binario!")); return; }
+
+  uint32_t totalRegistros = file.size() / sizeof(LogLine);
+  Serial.print(F("[SD] Iniciando envio via LoRa. Total de registros: "));
+  Serial.println(totalRegistros);
+
+  // 1) Anuncia quantos registros virao, para o Master detectar buracos depois
+  Response inicio = montarResposta(RESP_SD_INICIO);
+  inicio.dados.sdInicio.totalRegistros = (uint16_t)totalRegistros;
+  enviarResposta(inicio);
+  delay(150);
+
+  // 2) Envia cada registro
+  LogLine reg;
+  uint16_t seq = 0;
+  while (file.read((uint8_t*)&reg, sizeof(LogLine)) == sizeof(LogLine)) {
+    Response r = montarResposta(RESP_SD_RECORD);
+    r.dados.sdRegistro.seq        = seq;
+    r.dados.sdRegistro.tempo      = reg.tempo;
+    r.dados.sdRegistro.estado     = reg.estado;
+    r.dados.sdRegistro.altitude   = reg.altitude;
+    r.dados.sdRegistro.velocidade = reg.velocidade;
+    r.dados.sdRegistro.accX       = reg.accX;
+    r.dados.sdRegistro.accY       = reg.accY;
+    r.dados.sdRegistro.accZ       = reg.accZ;
+    r.dados.sdRegistro.lat        = reg.lat;
+    r.dados.sdRegistro.lon        = reg.lon;
+    enviarResposta(r);
+
+    Serial.print(F("[SD] Enviado registro ")); Serial.print(seq + 1);
+    Serial.print("/"); Serial.println(totalRegistros);
+
+    seq++;
+    delay(120); // airtime menor que a v3.4 (pacote fixo de 43 bytes)
   }
-  Response r; memset(&r, 0, sizeof(Response)); r.resp = RESP_SD_FIM; enviarResposta(r);
+  file.close();
+
+  Response fim = montarResposta(RESP_SD_FIM);
+  enviarResposta(fim);
+  Serial.println(F("[SD] Envio concluido."));
+}
+
+// Reenvia UM registro especifico, por seq, sem precisar refazer o dump inteiro.
+// Usado pelo Master quando detecta um buraco (pacote perdido) ao final do download.
+void enviarRegistroSD(uint16_t seq) {
+  if (!statusSD) return;
+  File file = SD.open(nomeArquivoVooBin, FILE_READ);
+  if (!file) return;
+
+  uint32_t offset = (uint32_t)seq * sizeof(LogLine);
+  if (offset >= file.size()) { file.close(); return; }
+
+  file.seek(offset);
+  LogLine reg;
+  if (file.read((uint8_t*)&reg, sizeof(LogLine)) == sizeof(LogLine)) {
+    Response r = montarResposta(RESP_SD_RECORD);
+    r.dados.sdRegistro.seq        = seq;
+    r.dados.sdRegistro.tempo      = reg.tempo;
+    r.dados.sdRegistro.estado     = reg.estado;
+    r.dados.sdRegistro.altitude   = reg.altitude;
+    r.dados.sdRegistro.velocidade = reg.velocidade;
+    r.dados.sdRegistro.accX       = reg.accX;
+    r.dados.sdRegistro.accY       = reg.accY;
+    r.dados.sdRegistro.accZ       = reg.accZ;
+    r.dados.sdRegistro.lat        = reg.lat;
+    r.dados.sdRegistro.lon        = reg.lon;
+    enviarResposta(r);
+    Serial.print(F("[SD] Reenviado registro seq=")); Serial.println(seq);
+  }
+  file.close();
 }
